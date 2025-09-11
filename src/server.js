@@ -21,6 +21,7 @@ let cachedData = {
 // Environment
 const PORT = process.env.PORT || 3000;
 const MUSIC_LIST_URL = process.env.MUSIC_LIST_URL || 'https://leicestercathedral.org/music-list/';
+const MOCK_DATE = process.env.MOCK_DATE; // Format: YYYY-MM-DD
 
 // Utility functions
 function normalizeUnicode(text) {
@@ -74,7 +75,8 @@ function parseDate(dateStr, year) {
     const monthName = match[2];
     const monthIndex = months[monthName];
     if (monthIndex !== undefined) {
-      return new Date(year, monthIndex, day);
+      // Create date at noon UTC to avoid timezone shifts
+      return new Date(Date.UTC(year, monthIndex, day, 12, 0, 0));
     }
   }
   return null;
@@ -101,6 +103,8 @@ function isOrganPiece(text) {
 }
 
 function normalizePieceTitle(text) {
+  text = text.trim();
+  
   // Handle "Composer: Title" format
   const colonMatch = text.match(/^(.+?):\s*(.+)$/);
   if (colonMatch) {
@@ -119,7 +123,19 @@ function normalizePieceTitle(text) {
     return `Service in ${settingMatch[2]} — ${settingMatch[1]}`;
   }
   
-  return text.trim();
+  // Handle "Psalm NN Composer" format
+  const psalmComposerMatch = text.match(/^(Psalm\s+[\d\.–\-]+)\s+([A-Z][a-zA-Z\s\.]*?)$/i);
+  if (psalmComposerMatch) {
+    return `${psalmComposerMatch[1].trim()} — ${psalmComposerMatch[2].trim()}`;
+  }
+  
+  // Handle "Piece Composer" format (single space, composer is typically a surname)
+  const spaceMatch = text.match(/^(.+?)\s+([A-Z][a-z]+(?:\s+[A-Z]\.?[a-z]*)*)\s*$/);
+  if (spaceMatch && !text.match(/\d/) && spaceMatch[2].length < 30) {
+    return `${spaceMatch[1].trim()} — ${spaceMatch[2].trim()}`;
+  }
+  
+  return text;
 }
 
 function classifyPiece(text) {
@@ -131,9 +147,50 @@ function classifyPiece(text) {
   if (lower.includes('anthem')) return 'anthems';
   if (lower.includes('magnificat') || lower.includes('nunc dimittis') || 
       lower.includes('canticles') || lower.includes('service') ||
-      lower.includes('te deum') || lower.includes('jubilate')) return 'settings';
+      lower.includes('te deum') || lower.includes('jubilate') ||
+      lower.includes('responses')) return 'settings';
       
   return 'other';
+}
+
+function splitMultiplePieces(line) {
+  // Common patterns that indicate separate pieces on one line
+  
+  // Pattern: "Something Psalm NN Composer" - detect psalm in middle of line
+  const psalmMatch = line.match(/^(.+?)\s+(Psalm\s+\d+[\w\s\-–.]*?)$/i);
+  if (psalmMatch) {
+    const first = psalmMatch[1].trim();
+    const psalm = psalmMatch[2].trim();
+    if (first && psalm) {
+      return [first, psalm];
+    }
+  }
+  
+  // Pattern: "Something Hymn NN" or "Something Hymns NN, NN, NN"
+  const hymnMatch = line.match(/^(.+?)\s+(Hymns?\s+[\d,\s]+)$/i);
+  if (hymnMatch) {
+    const first = hymnMatch[1].trim();
+    const hymn = hymnMatch[2].trim();
+    if (first && hymn) {
+      return [first, hymn];
+    }
+  }
+  
+  // Pattern: Multiple distinct pieces separated by keywords
+  const keywords = ['Prelude', 'Postlude', 'Voluntary', 'Toccata', 'Anthem', 'Magnificat', 'Nunc Dimittis'];
+  for (const keyword of keywords) {
+    if (line.toLowerCase().includes(keyword.toLowerCase()) && line.indexOf(keyword) > 0) {
+      const idx = line.indexOf(keyword);
+      const first = line.substring(0, idx).trim();
+      const second = line.substring(idx).trim();
+      if (first && second) {
+        return [first, second];
+      }
+    }
+  }
+  
+  // Default: return as single piece
+  return [line];
 }
 
 function hasSongmen(choirText) {
@@ -193,7 +250,7 @@ async function parsePDF(pdfUrl) {
       useSystemFonts: true
     }).promise;
     
-    let fullText = '';
+    let allLines = [];
     
     // Extract text from all pages
     for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
@@ -201,39 +258,35 @@ async function parsePDF(pdfUrl) {
       const textContent = await page.getTextContent();
       
       // Group text items by Y position (lines)
-      const lines = {};
+      const lineGroups = {};
       for (const item of textContent.items) {
         const y = Math.round(item.transform[5]);
-        if (!lines[y]) {
-          lines[y] = [];
+        if (!lineGroups[y]) {
+          lineGroups[y] = [];
         }
-        lines[y].push({
+        lineGroups[y].push({
           x: item.transform[4],
           text: item.str
         });
       }
       
       // Sort lines by Y position (top to bottom)
-      const sortedYPositions = Object.keys(lines)
+      const sortedYPositions = Object.keys(lineGroups)
         .map(Number)
         .sort((a, b) => b - a); // Descending (top to bottom)
       
-      let pageText = '';
       for (const y of sortedYPositions) {
         // Sort items on this line by X position (left to right)
-        const lineItems = lines[y].sort((a, b) => a.x - b.x);
+        const lineItems = lineGroups[y].sort((a, b) => a.x - b.x);
         const lineText = lineItems.map(item => item.text).join(' ').trim();
         
         if (lineText) {
-          pageText += lineText + '\n';
+          allLines.push(normalizeUnicode(lineText));
         }
       }
-      
-      fullText += pageText;
     }
     
-    const text = normalizeUnicode(fullText);
-    const lines = text.split('\n').map(line => line.trim()).filter(line => line);
+    const lines = allLines;
     
     // Extract date range from header
     let endDate = null;
@@ -268,12 +321,30 @@ async function parsePDF(pdfUrl) {
         continue;
       }
       
-      // Service line (starts with 4-digit time or standard time)
-      const timeMatch = line.match(/^(\d{4}|\d{1,2}[:.]?\d{0,2}\s*(?:am|pm)?)\s+(.+?)(?:\s*\(([^)]+)\))?$/i);
-      if (timeMatch) {
+      // Service line (starts with 4-digit time or standard time, but not date ranges)
+      const timeMatch = line.match(/^(\d{4}|\d{1,2}[:.]?\d{0,2}\s*(?:am|pm)?)\s+(.+?)$/i);
+      if (timeMatch && !line.includes('AUGUST') && !line.includes('SEPTEMBER') && 
+          (line.includes('Eucharist') || line.includes('Evensong') || line.includes('Morning Prayer') || line.includes('Evening Prayer'))) {
         const time = parseTime(timeMatch[1]);
-        const serviceTitle = timeMatch[2].trim();
-        const choir = timeMatch[3] || '';
+        const fullServiceLine = timeMatch[2].trim();
+        
+        // Extract choir from parentheses anywhere in the line
+        const choirMatch = fullServiceLine.match(/\(([^)]+)\)/);
+        const choir = choirMatch ? choirMatch[1] : '';
+        
+        // Service title is everything before the choir parentheses
+        const serviceTitle = choirMatch 
+          ? fullServiceLine.substring(0, choirMatch.index).trim()
+          : fullServiceLine;
+        
+        // Extract any text after choir parentheses as the first piece
+        let firstPiece = null;
+        if (choirMatch) {
+          const afterChoir = fullServiceLine.substring(choirMatch.index + choirMatch[0].length).trim();
+          if (afterChoir) {
+            firstPiece = afterChoir;
+          }
+        }
         
         if (currentService) {
           services.push(currentService);
@@ -293,6 +364,16 @@ async function parsePDF(pdfUrl) {
           },
           rawLines: []
         };
+        
+        // Add the first piece if found
+        if (firstPiece) {
+          currentService.rawLines.push(firstPiece);
+          const normalizedPiece = normalizePieceTitle(firstPiece);
+          const category = classifyPiece(firstPiece);
+          if (category !== 'other') {
+            currentService.pieces[category].push(normalizedPiece);
+          }
+        }
         i++;
         continue;
       }
@@ -301,11 +382,16 @@ async function parsePDF(pdfUrl) {
       if (currentService && line && !line.match(/^(SUNDAY|MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY)/i)) {
         currentService.rawLines.push(line);
         
-        const normalizedPiece = normalizePieceTitle(line);
-        const category = classifyPiece(line);
+        // Try to split multiple pieces on one line
+        const pieces = splitMultiplePieces(line);
         
-        if (category !== 'other') {
-          currentService.pieces[category].push(normalizedPiece);
+        for (const piece of pieces) {
+          const normalizedPiece = normalizePieceTitle(piece);
+          const category = classifyPiece(piece);
+          
+          if (category !== 'other') {
+            currentService.pieces[category].push(normalizedPiece);
+          }
         }
       }
       
@@ -328,7 +414,7 @@ async function refreshData() {
     const { services, endDate: parsedEndDate } = await parsePDF(pdfUrl);
     
     const finalEndDate = parsedEndDate || endDate;
-    const now = new Date();
+    const now = MOCK_DATE ? new Date(`${MOCK_DATE}T12:00:00.000Z`) : new Date();
     const isStale = finalEndDate && now > finalEndDate;
     
     cachedData = {
@@ -342,6 +428,11 @@ async function refreshData() {
     };
     
     console.log(`Data refreshed: ${cachedData.services.length} Songmen services, stale: ${isStale}`);
+    if (MOCK_DATE) {
+      console.log(`Using mock date: ${MOCK_DATE}`);
+      const currentServices = getCurrentServices();
+      console.log(`Current services available: ${currentServices.length}`);
+    }
   } catch (error) {
     cachedData.error = error.message;
     console.error('Failed to refresh data:', error);
@@ -351,7 +442,7 @@ async function refreshData() {
 function getCurrentServices() {
   if (cachedData.isStale) return [];
   
-  const now = new Date();
+  const now = MOCK_DATE ? new Date(`${MOCK_DATE}T12:00:00.000Z`) : new Date();
   const tenMinutesAgo = new Date(now.getTime() - 10 * 60 * 1000);
   
   return cachedData.services.filter(service => {
@@ -359,7 +450,7 @@ function getCurrentServices() {
     
     const [hour, minute] = service.time.split(':').map(Number);
     const serviceDateTime = new Date(service.date);
-    serviceDateTime.setHours(hour, minute, 0, 0);
+    serviceDateTime.setUTCHours(hour, minute, 0, 0);
     
     return serviceDateTime >= tenMinutesAgo;
   });
@@ -372,14 +463,14 @@ function getNextService() {
 
 function getCurrentWeekServices() {
   const services = getCurrentServices();
-  const now = new Date();
+  const now = MOCK_DATE ? new Date(`${MOCK_DATE}T12:00:00.000Z`) : new Date();
   const startOfWeek = new Date(now);
-  startOfWeek.setDate(now.getDate() - now.getDay() + 1); // Monday
-  startOfWeek.setHours(0, 0, 0, 0);
+  startOfWeek.setUTCDate(now.getUTCDate() - now.getUTCDay() + 1); // Monday
+  startOfWeek.setUTCHours(0, 0, 0, 0);
   
   const endOfWeek = new Date(startOfWeek);
-  endOfWeek.setDate(startOfWeek.getDate() + 6); // Sunday
-  endOfWeek.setHours(23, 59, 59, 999);
+  endOfWeek.setUTCDate(startOfWeek.getUTCDate() + 6); // Sunday
+  endOfWeek.setUTCHours(23, 59, 59, 999);
   
   return services.filter(service => {
     return service.date >= startOfWeek && service.date <= endOfWeek;
