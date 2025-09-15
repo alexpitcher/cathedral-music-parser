@@ -62,6 +62,18 @@ All endpoints default to `text/plain; charset=utf-8` except JSON paths:
 - **GET /json/next** → JSON for next qualifying service (also available at `/json` for back-compat)
 - **GET /json/week** → JSON array for current ISO week (Mon–Sun)
 
+### Cisco IP Phone (XML)
+
+These endpoints return CiscoIPPhoneXML (Content-Type: `text/xml; charset=utf-8`) suitable for Cisco desk phones.
+
+- **GET /cisco/menu** → CiscoIPPhoneMenu with options
+- **GET /cisco/text?mode=next** → CiscoIPPhoneText for the next service
+- **GET /cisco/text?mode=week** → CiscoIPPhoneText listing this week’s services
+
+Notes:
+- XML is escaped; body uses the same human-readable blocks as text endpoints.
+- Headers `X-Source-End-Date`, `X-Last-Fetch`, `X-Stale` are also present.
+
 Example (/songmen/next)
 
 ```
