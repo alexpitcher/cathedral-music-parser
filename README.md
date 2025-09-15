@@ -2,7 +2,7 @@
 
 Minimal text service that outputs only Leicester Cathedral "Songmen" services parsed from the latest Music List PDF.
 
-## Quick Start
+## Quick Start (Local)
 
 ```bash
 npm install
@@ -21,6 +21,31 @@ Service runs on `http://localhost:3000`.
 - `MUSIC_LIST_URL` - Leicester Cathedral music list page (default: https://leicestercathedral.org/music-list/)
 - `MUSIC_LIST_PDF_PATH` (or `FIXTURE_PDF_PATH`) - Path to a local PDF fixture. When set, discovery is skipped and the local PDF is parsed.
 - `MOCK_DATE` - Mock current instant. Accepts `YYYY-MM-DD` (interpreted as 12:00Z) or a full ISO datetime like `2025-09-07T10:00:00Z`. Useful for testing selection right before/after services.
+
+## Run with Docker (GHCR)
+
+Public image: `ghcr.io/alexpitcher/cathedral-music-parser`
+
+```bash
+# Pull the image (use a specific tag like :main, :v1.2.3, or :<sha>)
+docker pull ghcr.io/alexpitcher/cathedral-music-parser:main
+
+# Run on port 3000
+docker run --rm -p 3000:3000 ghcr.io/alexpitcher/cathedral-music-parser:main
+
+# With a local fixture and mock date
+docker run --rm -p 3000:3000 \
+  -e MUSIC_LIST_PDF_PATH=/data/music-list.pdf \
+  -e MOCK_DATE=2025-09-01 \
+  -v $(pwd)/music-list.pdf:/data/music-list.pdf:ro \
+  ghcr.io/alexpitcher/cathedral-music-parser:main
+```
+
+If the package is private, authenticate first:
+
+```bash
+echo $GHCR_TOKEN | docker login ghcr.io -u <github-username> --password-stdin
+```
 
 ## Endpoints
 
@@ -72,7 +97,7 @@ To point tests at a local fixture PDF instead of the live site, set `MUSIC_LIST_
 MOCK_DATE=2025-09-02 MUSIC_LIST_PDF_PATH=./music-list.pdf npm start
 ```
 
-## Docker
+## Docker (Local Build)
 
 ```bash
 # Build + run with Docker
@@ -93,7 +118,7 @@ docker run --rm -p 3000:3000 \
 ## CI / Images
 
 - A GitHub Action builds and publishes images to GHCR on push to `main`/`master` and tags.
-- Image name: `ghcr.io/<owner>/<repo>:<tag>` (branch, semver tag, or SHA).
+- Image name: `ghcr.io/<owner>/<repo>:<tag>` — for this repo: `ghcr.io/alexpitcher/cathedral-music-parser:<tag>` (branch, semver tag, or SHA).
 - You can pull and run the published image similarly to the local Docker example above.
 
 ## Development
