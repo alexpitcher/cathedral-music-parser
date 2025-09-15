@@ -1028,6 +1028,54 @@ fastify.get('/cisco/next', async (request, reply) => {
   }
 });
 
+// Cisco 79xx-friendly Week list (next 5 services this week)
+fastify.get('/cisco/week', async (request, reply) => {
+  reply.header('Content-Type', 'text/xml; charset=US-ASCII');
+  reply.header('X-Source-End-Date', cachedData.endDate ? cachedData.endDate.toISOString().split('T')[0] : '');
+  reply.header('X-Last-Fetch', cachedData.lastFetch ? cachedData.lastFetch.toISOString() : '');
+  reply.header('X-Stale', cachedData.isStale ? 'true' : 'false');
+
+  const title = 'This Week — Songmen';
+  const prompt = 'Press Exit to close';
+
+  try {
+    if (cachedData.error) {
+      const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<CiscoIPPhoneText>\n<Title>${escapeXml(title)}</Title>\n<Prompt>Error</Prompt>\n<Text>Service unavailable.</Text>\n</CiscoIPPhoneText>`;
+      return xml;
+    }
+    if (cachedData.isStale) {
+      const endStr = cachedData.endDate ? cachedData.endDate.toISOString().split('T')[0] : 'unknown';
+      const text = asciiSanitize(`STALE - list ended ${endStr}\nNo newer list published.`);
+      const xml = `<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CiscoIPPhoneText>\n<Title>${escapeXml(title)}</Title>\n<Prompt>${escapeXml(prompt)}</Prompt>\n<Text>${escapeXml(text)}</Text>\n<SoftKeyItem>\n<Name>Exit</Name>\n<URL>Init:Services</URL>\n<Position>1</Position>\n</SoftKeyItem>\n</CiscoIPPhoneText>`;
+      return xml;
+    }
+
+    const week = getCurrentWeekServices();
+    const now = getMockDate() || new Date();
+    const todayStr = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString().split('T')[0];
+    const tomorrowStr = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)).toISOString().split('T')[0];
+    const weekday = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+
+    const lines = [];
+    for (const svc of week.slice(0, 5)) {
+      const svcDateStr = svc.date.toISOString().split('T')[0];
+      let label;
+      if (svcDateStr === todayStr) label = 'Today';
+      else if (svcDateStr === tomorrowStr) label = 'Tomorrow';
+      else label = weekday[svc.date.getUTCDay()];
+      const line = `${label} ${svc.time} ${shortService(svc.service)}`;
+      lines.push(truncate32(line));
+    }
+
+    const text = asciiSanitize(lines.length ? lines.join('\n') : 'No upcoming services');
+    const xml = `<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CiscoIPPhoneText>\n<Title>${escapeXml(title)}</Title>\n<Prompt>${escapeXml(prompt)}</Prompt>\n<Text>${escapeXml(text)}</Text>\n<SoftKeyItem>\n<Name>Exit</Name>\n<URL>Init:Services</URL>\n<Position>1</Position>\n</SoftKeyItem>\n</CiscoIPPhoneText>`;
+    return xml;
+  } catch (error) {
+    const xml = `<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CiscoIPPhoneText>\n<Title>${escapeXml(title)}</Title>\n<Prompt>Error</Prompt>\n<Text>Service unavailable.</Text>\n</CiscoIPPhoneText>`;
+    return xml;
+  }
+});
+
 // Cisco IP phone XML endpoints
 fastify.get('/cisco/text', async (request, reply) => {
   reply.header('Content-Type', 'text/xml; charset=utf-8');
@@ -1104,11 +1152,11 @@ fastify.get('/cisco/menu', async (request, reply) => {
 <Prompt>Select option</Prompt>
 <MenuItem>
 <Name>Next</Name>
-<URL>${baseUrl}/cisco/text?mode=next</URL>
+<URL>/cisco/next</URL>
 </MenuItem>
 <MenuItem>
 <Name>This Week</Name>
-<URL>${baseUrl}/cisco/text?mode=week</URL>
+<URL>/cisco/week</URL>
 </MenuItem>
 <SoftKeyItem>
 <Name>Select</Name>
