@@ -69,10 +69,16 @@ These endpoints return CiscoIPPhoneXML (Content-Type: `text/xml; charset=utf-8`)
 - **GET /cisco/menu** → CiscoIPPhoneMenu with options
 - **GET /cisco/text?mode=next** → CiscoIPPhoneText for the next service
 - **GET /cisco/text?mode=week** → CiscoIPPhoneText listing this week’s services
+- **GET /cisco/next** → CiscoIPPhoneText, 79xx-friendly concise layout (ASCII-only, ~32 chars/line)
 
 Notes:
 - XML is escaped; body uses the same human-readable blocks as text endpoints.
 - Headers `X-Source-End-Date`, `X-Last-Fetch`, `X-Stale` are also present.
+
+Cisco 7960 setup
+- Point the phone Services URL to `http://YOUR-HOST:3000/cisco/next`.
+- Content-Type is `text/xml`; payload is ASCII-safe. You can test in a browser — response starts with `<CiscoIPPhoneText>`.
+- For a simple menu, point to `/cisco/menu` (Next/Week items).
 
 Example (/songmen/next)
 

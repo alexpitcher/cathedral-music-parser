@@ -940,6 +940,94 @@ function escapeXml(text) {
     .replace(/'/g, '&apos;');
 }
 
+// ASCII sanitizer and helpers for Cisco 79xx handsets
+function asciiSanitize(text) {
+  if (!text) return '';
+  let t = String(text).normalize('NFKC')
+    .replace(/ﬁ/g, 'fi')
+    .replace(/ﬂ/g, 'fl')
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/[–—]/g, '-')
+    .replace(/•/g, '-')
+    .replace(/\u00AD/g, '');
+  // Strip non-ASCII (keep CR/LF/TAB)
+  t = t.replace(/[\u0080-\uFFFF]/g, ' ');
+  // Collapse spaces and trim trailing spaces
+  t = t.replace(/[\t ]{2,}/g, ' ').replace(/[ \t]+$/g, '');
+  return t;
+}
+
+function shortService(title) {
+  if (!title) return '';
+  const m = String(title).match(/^(.*?)\s+with\s+/i);
+  return m ? m[1] : String(title);
+}
+
+function firstOrEmpty(arr) {
+  return Array.isArray(arr) && arr.length > 0 ? arr[0] : '';
+}
+
+function truncate32(s) {
+  if (!s) return '';
+  const a = asciiSanitize(s);
+  return a.length <= 32 ? a : a.slice(0, 29) + '...';
+}
+
+// Cisco 79xx-friendly Next service endpoint
+fastify.get('/cisco/next', async (request, reply) => {
+  reply.header('Content-Type', 'text/xml; charset=US-ASCII');
+  reply.header('X-Source-End-Date', cachedData.endDate ? cachedData.endDate.toISOString().split('T')[0] : '');
+  reply.header('X-Last-Fetch', cachedData.lastFetch ? cachedData.lastFetch.toISOString() : '');
+  reply.header('X-Stale', cachedData.isStale ? 'true' : 'false');
+
+  const title = 'Next Songmen Service';
+  const prompt = 'Press Exit to close';
+
+  try {
+    if (cachedData.error) {
+      const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<CiscoIPPhoneText>\n<Title>${escapeXml(title)}</Title>\n<Prompt>Error</Prompt>\n<Text>Service unavailable.</Text>\n</CiscoIPPhoneText>`;
+      return xml;
+    }
+
+    if (cachedData.isStale) {
+      const endStr = cachedData.endDate ? cachedData.endDate.toISOString().split('T')[0] : 'unknown';
+      const text = asciiSanitize(`STALE - list ended ${endStr}\nNo newer list published.`);
+      const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<CiscoIPPhoneText>\n<Title>${escapeXml(title)}</Title>\n<Prompt>${escapeXml(prompt)}</Prompt>\n<Text>${escapeXml(text)}</Text>\n</CiscoIPPhoneText>`;
+      return xml;
+    }
+
+    const next = getNextService();
+    if (!next) {
+      const xml = `<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CiscoIPPhoneText>\n<Title>${escapeXml(title)}</Title>\n<Prompt>${escapeXml(prompt)}</Prompt>\n<Text>Service unavailable.</Text>\n</CiscoIPPhoneText>`;
+      return xml;
+    }
+
+    const dateStr = next.date.toISOString().split('T')[0];
+    const timeStr = next.time;
+    const choir = (next.choir || '').replace(/\band\b/gi, '&');
+    const firstSetting = firstOrEmpty(next.pieces?.settings || []);
+    const firstAnthem = firstOrEmpty(next.pieces?.anthems || []);
+    const endStr = cachedData.endDate ? cachedData.endDate.toISOString().split('T')[0] : '';
+
+    const lines = [];
+    lines.push(truncate32(`${dateStr} ${timeStr}`));
+    lines.push(truncate32(shortService(next.service)));
+    lines.push(truncate32(choir));
+    if (firstSetting) lines.push(truncate32(firstSetting));
+    if (firstAnthem) lines.push(truncate32(firstAnthem));
+    if (endStr) lines.push(truncate32(`List to ${endStr}`));
+    lines.push('More: /songmen/next');
+
+    const text = asciiSanitize(lines.join('\n'));
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<CiscoIPPhoneText>\n<Title>${escapeXml(title)}</Title>\n<Prompt>${escapeXml(prompt)}</Prompt>\n<Text>${escapeXml(text)}</Text>\n</CiscoIPPhoneText>`;
+    return xml;
+  } catch (error) {
+    const xml = `<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CiscoIPPhoneText>\n<Title>${escapeXml(title)}</Title>\n<Prompt>Error</Prompt>\n<Text>Service unavailable.</Text>\n</CiscoIPPhoneText>`;
+    return xml;
+  }
+});
+
 // Cisco IP phone XML endpoints
 fastify.get('/cisco/text', async (request, reply) => {
   reply.header('Content-Type', 'text/xml; charset=utf-8');
