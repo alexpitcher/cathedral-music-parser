@@ -1,0 +1,18 @@
+version: '3.8'
+services:
+  cathedral-music-parser:
+    build: .
+    image: cathedral-music-parser:local
+    container_name: cathedral-music-parser
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - MUSIC_LIST_URL=https://leicestercathedral.org/music-list/
+      # Uncomment to use a fixture mounted into the container
+      # - MUSIC_LIST_PDF_PATH=/data/music-list.pdf
+      # - MOCK_DATE=2025-09-01
+    # volumes:
+    #   - ./music-list.pdf:/data/music-list.pdf:ro
+    restart: unless-stopped
+

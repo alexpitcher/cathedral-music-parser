@@ -30,3 +30,13 @@ test-*.js
 # Temporary files
 *.tmp
 *.temp
+
+node_modules/
+npm-debug.log*
+package-lock.json   
+yarn.lock
+
+test*.js
+music_list.pdf
+test-pdf.js 
+

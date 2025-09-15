@@ -929,6 +929,124 @@ fastify.get('/json/week', async (request, reply) => {
   };
 });
 
+// XML escaping utility for Cisco IP phone XML
+function escapeXml(text) {
+  if (!text) return '';
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+// Cisco IP phone XML endpoints
+fastify.get('/cisco/text', async (request, reply) => {
+  reply.header('Content-Type', 'text/xml; charset=utf-8');
+  reply.header('X-Source-End-Date', cachedData.endDate ? cachedData.endDate.toISOString().split('T')[0] : '');
+  reply.header('X-Last-Fetch', cachedData.lastFetch ? cachedData.lastFetch.toISOString() : '');
+  reply.header('X-Stale', cachedData.isStale ? 'true' : 'false');
+  
+  try {
+    const query = request.query || {};
+    const mode = query.mode === 'next' ? 'next' : 'week';
+    
+    let title = 'Leicester Songmen';
+    let prompt, text;
+    
+    if (cachedData.isStale || cachedData.error) {
+      const endDateStr = cachedData.endDate ? cachedData.endDate.toISOString().split('T')[0] : 'unknown';
+      prompt = `STALE until ${endDateStr}`;
+      text = getStaleMessage();
+    } else {
+      if (mode === 'next') {
+        prompt = 'Next service';
+        const nextService = getNextService();
+        if (!nextService) {
+          text = getStaleMessage();
+        } else {
+          text = formatServiceHuman(nextService);
+        }
+      } else { // week
+        prompt = 'This week';
+        const weekServices = getCurrentWeekServices();
+        if (weekServices.length === 0) {
+          text = '';
+        } else {
+          text = weekServices.map(formatServiceHuman).join('\n\n');
+        }
+      }
+    }
+    
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<CiscoIPPhoneText>
+<Title>${escapeXml(title)}</Title>
+<Prompt>${escapeXml(prompt)}</Prompt>
+<Text>${escapeXml(text)}</Text>
+</CiscoIPPhoneText>`;
+    
+    return xml;
+  } catch (error) {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<CiscoIPPhoneText>
+<Title>Leicester Songmen</Title>
+<Prompt>Error</Prompt>
+<Text>Service unavailable.</Text>
+</CiscoIPPhoneText>`;
+    
+    return xml;
+  }
+});
+
+fastify.get('/cisco/menu', async (request, reply) => {
+  reply.header('Content-Type', 'text/xml; charset=utf-8');
+  reply.header('X-Source-End-Date', cachedData.endDate ? cachedData.endDate.toISOString().split('T')[0] : '');
+  reply.header('X-Last-Fetch', cachedData.lastFetch ? cachedData.lastFetch.toISOString() : '');
+  reply.header('X-Stale', cachedData.isStale ? 'true' : 'false');
+  
+  try {
+    // Construct absolute URLs for menu items
+    const protocol = request.headers['x-forwarded-proto'] || (request.socket.encrypted ? 'https' : 'http');
+    const host = request.headers.host || `localhost:${PORT}`;
+    const baseUrl = `${protocol}://${host}`;
+    
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<CiscoIPPhoneMenu>
+<Title>Leicester Songmen</Title>
+<Prompt>Select option</Prompt>
+<MenuItem>
+<Name>Next</Name>
+<URL>${baseUrl}/cisco/text?mode=next</URL>
+</MenuItem>
+<MenuItem>
+<Name>This Week</Name>
+<URL>${baseUrl}/cisco/text?mode=week</URL>
+</MenuItem>
+<SoftKeyItem>
+<Name>Select</Name>
+<URL>SoftKey:Select</URL>
+<Position>1</Position>
+</SoftKeyItem>
+<SoftKeyItem>
+<Name>Exit</Name>
+<URL>SoftKey:Exit</URL>
+<Position>2</Position>
+</SoftKeyItem>
+</CiscoIPPhoneMenu>`;
+    
+    return xml;
+  } catch (error) {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<CiscoIPPhoneText>
+<Title>Leicester Songmen</Title>
+<Prompt>Error</Prompt>
+<Text>Service unavailable.</Text>
+</CiscoIPPhoneText>`;
+    
+    return xml;
+  }
+});
+
 // Start server
 async function start() {
   try {
