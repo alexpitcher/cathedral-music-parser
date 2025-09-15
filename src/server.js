@@ -1020,7 +1020,7 @@ fastify.get('/cisco/next', async (request, reply) => {
     lines.push('More: /songmen/next');
 
     const text = asciiSanitize(lines.join('\n'));
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<CiscoIPPhoneText>\n<Title>${escapeXml(title)}</Title>\n<Prompt>${escapeXml(prompt)}</Prompt>\n<Text>${escapeXml(text)}</Text>\n</CiscoIPPhoneText>`;
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<CiscoIPPhoneText>\n<Title>${escapeXml(title)}</Title>\n<Prompt>${escapeXml(prompt)}</Prompt>\n<Text>${escapeXml(text)}</Text>\n<SoftKeyItem>\n<Name>Exit</Name>\n<URL>Init:Services</URL>\n<Position>1</Position>\n</SoftKeyItem>\n</CiscoIPPhoneText>`;
     return xml;
   } catch (error) {
     const xml = `<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CiscoIPPhoneText>\n<Title>${escapeXml(title)}</Title>\n<Prompt>Error</Prompt>\n<Text>Service unavailable.</Text>\n</CiscoIPPhoneText>`;
