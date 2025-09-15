@@ -3,6 +3,7 @@
 import Fastify from 'fastify';
 import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
+import fs from 'fs/promises';
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
 
 const fastify = Fastify({ logger: false });
@@ -21,7 +22,20 @@ let cachedData = {
 // Environment
 const PORT = process.env.PORT || 3000;
 const MUSIC_LIST_URL = process.env.MUSIC_LIST_URL || 'https://leicestercathedral.org/music-list/';
-const MOCK_DATE = process.env.MOCK_DATE; // Format: YYYY-MM-DD
+const MUSIC_LIST_PDF_PATH = process.env.MUSIC_LIST_PDF_PATH || process.env.FIXTURE_PDF_PATH || null;
+const MOCK_DATE = process.env.MOCK_DATE; // Format: YYYY-MM-DD or full ISO timestamp
+
+function getMockDate() {
+  if (!MOCK_DATE) return null;
+  
+  // If it already contains 'T', it's a full ISO timestamp
+  if (MOCK_DATE.includes('T')) {
+    return new Date(MOCK_DATE);
+  }
+  
+  // Otherwise, it's just a date, append noon UTC
+  return new Date(`${MOCK_DATE}T12:00:00.000Z`);
+}
 
 // Utility functions
 function normalizeUnicode(text) {
@@ -31,6 +45,26 @@ function normalizeUnicode(text) {
     .replace(/\u00AD/g, '') // soft hyphens
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function normalizeOCRArtifacts(text) {
+  let t = text;
+  // Join digits split by spaces (e.g., 89.2 0 -> 89.20)
+  t = t.replace(/(?<=\d)\s+(?=\d)/g, '');
+  // Fix Hymn s -> Hymns
+  t = t.replace(/\bHymn\s+s\b/gi, 'Hymns');
+  // Fix split words like V oluntary, S aviour but not musical keys (E flat, D major, etc.)
+  const noJoinNext = new Set(['flat','sharp','major','minor']);
+  t = t.replace(/\b([A-Z])\s+([a-z]{2,})\b/g, (m, a, b) => noJoinNext.has(b) ? m : `${a}${b}`);
+  // Normalise L’Estrange from various broken OCR forms
+  t = t.replace(/L\s*[’'`-]+\s*(?:[-—]\s*)?Estrange/gi, "L’Estrange");
+  // Fix Mass for — Five Voices Byrd -> Mass for Five Voices — Byrd
+  t = t.replace(/^Mass\s+for\s+—\s+(.+?)\s+([A-Z][A-Za-z’'\-]+)$/, 'Mass for $1 — $2');
+  // Also remove stray dash right after "Mass for" so composer formatting can re-add correctly
+  t = t.replace(/\b(Mass\s+for)\s+[—–-]\s+/i, '$1 ');
+  // Remove stray em-dash after preposition "of" (e.g., Accession of — King Charles III)
+  t = t.replace(/\bof\s+—\s+/gi, 'of ');
+  return t;
 }
 
 function parseTime(timeStr) {
@@ -89,21 +123,33 @@ function isOrganPiece(text) {
     'processional', 'sortie', 'offertoire', 'trumpet tune', 'rondo',
     'scherzo', 'canzona', 'ricercar'
   ];
-  
   const choralKeywords = [
     'responses', 'canticles', 'magnificat', 'nunc dimittis', 'te deum',
     'jubilate', 'mass', 'psalm', 'hymn'
   ];
-  
   const lowerText = text.toLowerCase();
-  const hasOrgan = organKeywords.some(keyword => lowerText.includes(keyword));
-  const hasChoral = choralKeywords.some(keyword => lowerText.includes(keyword));
-  
+  const lowerNoSpace = lowerText.replace(/\s+/g, '');
+  const hasOrgan = organKeywords.some(keyword => {
+    const k = keyword.toLowerCase();
+    return lowerText.includes(k) || lowerNoSpace.includes(k.replace(/\s+/g, ''));
+  });
+  const hasChoral = choralKeywords.some(keyword => {
+    const k = keyword.toLowerCase();
+    return lowerText.includes(k) || lowerNoSpace.includes(k.replace(/\s+/g, ''));
+  });
   return hasOrgan && !hasChoral;
 }
 
 function normalizePieceTitle(text) {
-  text = text.trim();
+  text = normalizeOCRArtifacts(text.trim());
+  // If already contains an em dash, assume "Title — Composer" and leave
+  if (text.includes('—')) return text;
+  // Clean stray dash after "Mass for"
+  text = text.replace(/(Mass\s+for)\s*[—–-]\s*/gi, '$1 ');
+  // Fix cases like "A Prayer of — St Patrick Rutter" -> "A Prayer of St Patrick — Rutter"
+  text = text.replace(/\bof\s+[—–-]\s+(St(?:\.?|aint)?\s+[A-Z][A-Za-z’'\-]+)\s+([A-Z][A-Za-z’'\-]+)/, 'of $1 — $2');
+  // Collapse odd dash sequences like " - — " -> " — "
+  text = text.replace(/\s+-\s+—\s+/g, ' — ');
   
   // Handle "Composer: Title" format
   const colonMatch = text.match(/^(.+?):\s*(.+)$/);
@@ -117,11 +163,7 @@ function normalizePieceTitle(text) {
     return `${spacesMatch[1].trim()} — ${spacesMatch[2].trim()}`;
   }
   
-  // Handle service settings like "Wood in E-flat (No.2)"
-  const settingMatch = text.match(/^(\w+)\s+in\s+(.+)$/i);
-  if (settingMatch) {
-    return `Service in ${settingMatch[2]} — ${settingMatch[1]}`;
-  }
+  // Leave bare "Composer in Key" mappings for settings to higher-level formatter
   
   // Handle "Psalm NN Composer" format
   const psalmComposerMatch = text.match(/^(Psalm\s+[\d\.–\-]+)\s+([A-Z][a-zA-Z\s\.]*?)$/i);
@@ -129,8 +171,10 @@ function normalizePieceTitle(text) {
     return `${psalmComposerMatch[1].trim()} — ${psalmComposerMatch[2].trim()}`;
   }
   
-  // Handle "Piece Composer" format (single space, composer is typically a surname)
-  const spaceMatch = text.match(/^(.+?)\s+([A-Z][a-z]+(?:\s+[A-Z]\.?[a-z]*)*)\s*$/);
+  // Handle "Mass for — Five Voices Byrd" -> "Mass for Five Voices — Byrd"
+  text = text.replace(/\bMass\s+for\s+—\s+([^—;]+?)\s+([A-Z][A-Za-z’'\-]+)\b/, 'Mass for $1 — $2');
+  // Handle "Piece Composer" format (single space, composer may include apostrophes/hyphens)
+  const spaceMatch = text.match(/^(.+?)\s+([A-Z][A-Za-z’'\-]+(?:\s+[A-Z][A-Za-z’'\-\.]+)*)\s*$/);
   if (spaceMatch && !text.match(/\d/) && spaceMatch[2].length < 30) {
     return `${spaceMatch[1].trim()} — ${spaceMatch[2].trim()}`;
   }
@@ -141,56 +185,101 @@ function normalizePieceTitle(text) {
 function classifyPiece(text) {
   const lower = text.toLowerCase();
   
-  if (isOrganPiece(text)) return 'organ';
+  // Organ pieces first (most specific)
+  if (lower.includes('prelude') || lower.includes('postlude') || 
+      lower.includes('processional') || lower.includes('voluntary') || 
+      lower.includes('toccata') || lower.includes('fugue')) return 'organ';
+  
+  // Liturgical categories
   if (lower.includes('hymn')) return 'hymns';
   if (lower.includes('psalm')) return 'psalms';
   if (lower.includes('anthem')) return 'anthems';
+  
+  // Service settings (Magnificat/Nunc Dimittis, Responses, etc.)
   if (lower.includes('magnificat') || lower.includes('nunc dimittis') || 
-      lower.includes('canticles') || lower.includes('service') ||
-      lower.includes('te deum') || lower.includes('jubilate') ||
-      lower.includes('responses')) return 'settings';
-      
-  return 'other';
+      lower.includes('responses') || lower.includes('service')) return 'settings';
+  
+  // Heuristic for service settings: "Composer in Key" format 
+  // This should match "Wood in E", "Stanford in G", but NOT "God be in my head"
+  // Pattern: Single surname/composer name + "in" + musical key/mode
+  if (/^[A-Z][a-z]+\s+in\s+[A-Z]\s*(minor|major|flat|sharp|-\s*flat|-\s*sharp)?$/i.test(text)) return 'settings';
+  
+  return 'anthems'; // Default for most other pieces
+}
+
+function splitPsalmSection(section) {
+  // Handle "Psalms 110 Garrett , 150 Stanford" - multiple psalms with composers
+  const multiPsalmMatch = section.match(/^Psalms?\s+(.+)$/i);
+  if (multiPsalmMatch) {
+    const content = multiPsalmMatch[1];
+    
+    // Split on commas and numbers to separate multiple psalms
+    const parts = content.split(/,\s*/).map(p => p.trim());
+    const result = [];
+    
+    for (const part of parts) {
+      if (/^\d+/.test(part)) {
+        // Starts with number - this is a new psalm
+        result.push(`Psalm ${part}`);
+      } else if (result.length > 0) {
+        // Doesn't start with number - append to previous psalm
+        const lastIndex = result.length - 1;
+        result[lastIndex] += ` ${part}`;
+      } else {
+        // First item doesn't start with number - this is still part of the first psalm
+        result.push(`Psalm ${part}`);
+      }
+    }
+    
+    return result;
+  }
+  
+  return [section];
 }
 
 function splitMultiplePieces(line) {
-  // Common patterns that indicate separate pieces on one line
+  // Pattern 1: Remove service notes like "Preacher: Name" before processing
+  const cleanLine = line.replace(/\s+Preacher:\s+.+$/i, '').trim();
   
-  // Pattern: "Something Psalm NN Composer" - detect psalm in middle of line
-  const psalmMatch = line.match(/^(.+?)\s+(Psalm\s+\d+[\w\s\-–.]*?)$/i);
+  // Pattern 2: "Composer in Key Responses OtherComposer" - split service setting + responses
+  const settingResponsesMatch = cleanLine.match(/^([A-Z][a-z]+\s+in\s+[A-Za-z\s\-]+?)\s+(Responses\s+.+)$/i);
+  if (settingResponsesMatch) {
+    const setting = settingResponsesMatch[1].trim();
+    const responses = settingResponsesMatch[2].trim();
+    return [setting, responses];
+  }
+  
+  // Pattern 3: "Something Psalm(s) NN... rest" - detect psalm anywhere in line
+  const psalmMatch = cleanLine.match(/^(.+?)\s+(Psalms?\s+.+)$/i);
   if (psalmMatch) {
-    const first = psalmMatch[1].trim();
-    const psalm = psalmMatch[2].trim();
-    if (first && psalm) {
-      return [first, psalm];
+    const beforePsalm = psalmMatch[1].trim();
+    const psalmAndAfter = psalmMatch[2].trim();
+    
+    // Further split the psalm section if it contains multiple psalms
+    const psalmPieces = splitPsalmSection(psalmAndAfter);
+    
+    if (beforePsalm) {
+      return [beforePsalm, ...psalmPieces];
+    } else {
+      return psalmPieces;
     }
   }
   
-  // Pattern: "Something Hymn NN" or "Something Hymns NN, NN, NN"
-  const hymnMatch = line.match(/^(.+?)\s+(Hymns?\s+[\d,\s]+)$/i);
+  // Pattern 4: "Something Hymn(s) NN..." - detect hymn anywhere in line  
+  const hymnMatch = cleanLine.match(/^(.+?)\s+(Hymns?\s+.+)$/i);
   if (hymnMatch) {
-    const first = hymnMatch[1].trim();
-    const hymn = hymnMatch[2].trim();
-    if (first && hymn) {
-      return [first, hymn];
-    }
-  }
-  
-  // Pattern: Multiple distinct pieces separated by keywords
-  const keywords = ['Prelude', 'Postlude', 'Voluntary', 'Toccata', 'Anthem', 'Magnificat', 'Nunc Dimittis'];
-  for (const keyword of keywords) {
-    if (line.toLowerCase().includes(keyword.toLowerCase()) && line.indexOf(keyword) > 0) {
-      const idx = line.indexOf(keyword);
-      const first = line.substring(0, idx).trim();
-      const second = line.substring(idx).trim();
-      if (first && second) {
-        return [first, second];
-      }
+    const beforeHymn = hymnMatch[1].trim();
+    const hymnAndAfter = hymnMatch[2].trim();
+    
+    if (beforeHymn) {
+      return [beforeHymn, hymnAndAfter];
+    } else {
+      return [hymnAndAfter];
     }
   }
   
   // Default: return as single piece
-  return [line];
+  return [cleanLine];
 }
 
 function hasSongmen(choirText) {
@@ -244,9 +333,17 @@ async function parsePDF(pdfUrl) {
   try {
     const response = await fetch(pdfUrl);
     const arrayBuffer = await response.arrayBuffer();
-    
+    return await parsePDFBuffer(new Uint8Array(arrayBuffer));
+  } catch (error) {
+    throw new Error(`Failed to parse PDF: ${error.message}`);
+  }
+}
+
+async function parsePDFBuffer(uint8)
+{
+  try {
     const pdf = await pdfjsLib.getDocument({
-      data: new Uint8Array(arrayBuffer),
+      data: uint8,
       useSystemFonts: true
     }).promise;
     
@@ -281,7 +378,7 @@ async function parsePDF(pdfUrl) {
         const lineText = lineItems.map(item => item.text).join(' ').trim();
         
         if (lineText) {
-          allLines.push(normalizeUnicode(lineText));
+          allLines.push(normalizeOCRArtifacts(normalizeUnicode(lineText)));
         }
       }
     }
@@ -362,6 +459,7 @@ async function parsePDF(pdfUrl) {
             hymns: [],
             organ: []
           },
+          allPieces: [],
           rawLines: []
         };
         
@@ -370,6 +468,7 @@ async function parsePDF(pdfUrl) {
           currentService.rawLines.push(firstPiece);
           const normalizedPiece = normalizePieceTitle(firstPiece);
           const category = classifyPiece(firstPiece);
+          currentService.allPieces.push(normalizedPiece);
           if (category !== 'other') {
             currentService.pieces[category].push(normalizedPiece);
           }
@@ -389,6 +488,7 @@ async function parsePDF(pdfUrl) {
           const normalizedPiece = normalizePieceTitle(piece);
           const category = classifyPiece(piece);
           
+          currentService.allPieces.push(normalizedPiece);
           if (category !== 'other') {
             currentService.pieces[category].push(normalizedPiece);
           }
@@ -410,15 +510,42 @@ async function parsePDF(pdfUrl) {
 
 async function refreshData() {
   try {
-    const { url: pdfUrl, endDate } = await discoverLatestPDF();
-    const { services, endDate: parsedEndDate } = await parsePDF(pdfUrl);
+    let pdfUrl = null;
+    let discoveredEndDate = null;
+    let parsed;
+
+    if (MUSIC_LIST_PDF_PATH) {
+      const buf = await fs.readFile(MUSIC_LIST_PDF_PATH);
+      parsed = await parsePDFBuffer(new Uint8Array(buf));
+      pdfUrl = `file://${MUSIC_LIST_PDF_PATH}`;
+      discoveredEndDate = parsed.endDate;
+    } else {
+      const discovered = await discoverLatestPDF();
+      pdfUrl = discovered.url;
+      discoveredEndDate = discovered.endDate;
+      parsed = await parsePDF(pdfUrl);
+    }
+    const { services } = parsed;
     
-    const finalEndDate = parsedEndDate || endDate;
-    const now = MOCK_DATE ? new Date(`${MOCK_DATE}T12:00:00.000Z`) : new Date();
+    const finalEndDate = parsed.endDate || discoveredEndDate;
+    const now = getMockDate() || new Date();
     const isStale = finalEndDate && now > finalEndDate;
     
+    // Normalize and sort qualifying services
+    const qualifying = services
+      .filter(service => hasSongmen(service.choir))
+      .sort((a, b) => {
+        const [ah, am] = (a.time || '00:00').split(':').map(Number);
+        const [bh, bm] = (b.time || '00:00').split(':').map(Number);
+        const ad = new Date(a.date);
+        ad.setUTCHours(ah, am, 0, 0);
+        const bd = new Date(b.date);
+        bd.setUTCHours(bh, bm, 0, 0);
+        return ad - bd;
+      });
+
     cachedData = {
-      services: services.filter(service => hasSongmen(service.choir)),
+      services: qualifying,
       sourceUrl: MUSIC_LIST_URL,
       pdfUrl,
       endDate: finalEndDate,
@@ -429,7 +556,7 @@ async function refreshData() {
     
     console.log(`Data refreshed: ${cachedData.services.length} Songmen services, stale: ${isStale}`);
     if (MOCK_DATE) {
-      console.log(`Using mock date: ${MOCK_DATE}`);
+      console.log(`Using mock date/time: ${MOCK_DATE}`);
       const currentServices = getCurrentServices();
       console.log(`Current services available: ${currentServices.length}`);
     }
@@ -442,7 +569,7 @@ async function refreshData() {
 function getCurrentServices() {
   if (cachedData.isStale) return [];
   
-  const now = MOCK_DATE ? new Date(`${MOCK_DATE}T12:00:00.000Z`) : new Date();
+  const now = getMockDate() || new Date();
   const tenMinutesAgo = new Date(now.getTime() - 10 * 60 * 1000);
   
   return cachedData.services.filter(service => {
@@ -453,6 +580,14 @@ function getCurrentServices() {
     serviceDateTime.setUTCHours(hour, minute, 0, 0);
     
     return serviceDateTime >= tenMinutesAgo;
+  }).sort((a, b) => {
+    const [ah, am] = a.time.split(':').map(Number);
+    const [bh, bm] = b.time.split(':').map(Number);
+    const ad = new Date(a.date);
+    ad.setUTCHours(ah, am, 0, 0);
+    const bd = new Date(b.date);
+    bd.setUTCHours(bh, bm, 0, 0);
+    return ad - bd;
   });
 }
 
@@ -463,7 +598,7 @@ function getNextService() {
 
 function getCurrentWeekServices() {
   const services = getCurrentServices();
-  const now = MOCK_DATE ? new Date(`${MOCK_DATE}T12:00:00.000Z`) : new Date();
+  const now = getMockDate() || new Date();
   const startOfWeek = new Date(now);
   startOfWeek.setUTCDate(now.getUTCDate() - now.getUTCDay() + 1); // Monday
   startOfWeek.setUTCHours(0, 0, 0, 0);
@@ -477,17 +612,105 @@ function getCurrentWeekServices() {
   });
 }
 
+function getTomorrowServices() {
+  const services = getCurrentServices();
+  const now = getMockDate() || new Date();
+  const tomorrowStart = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate() + 1,
+    0, 0, 0, 0
+  ));
+  const tomorrowEnd = new Date(tomorrowStart);
+  tomorrowEnd.setUTCHours(23, 59, 59, 999);
+  return services.filter(svc => svc.date >= tomorrowStart && svc.date <= tomorrowEnd);
+}
+
+function getServicesOnDate(dateStr) {
+  // Use upcoming services list then filter to the given calendar date (YYYY-MM-DD)
+  const services = getCurrentServices();
+  return services.filter(svc => svc.date.toISOString().split('T')[0] === dateStr);
+}
+
+function canonicalizeSettingPiece(pieceText, serviceTitle) {
+  const lower = pieceText.toLowerCase();
+  // Already explicit
+  if (/(magnificat|nunc dimittis|te deum|jubilate|responses|canticles|service)/i.test(lower)) {
+    return normalizePieceTitle(pieceText);
+  }
+  // Pattern: Composer in Key
+  const m = pieceText.match(/^([A-Z][A-Za-z\.\s]+?)\s+in\s+(.+)$/);
+  if (m) {
+    const composer = m[1].trim().replace(/\s+/g, ' ');
+    const key = m[2].trim().replace(/\s*-\s*/g, ' - ').replace(/\s*no\.\s*/i, 'no. ');
+    if (/evensong|evening prayer/i.test(serviceTitle || '')) {
+      return `Mag and Nunc in ${key} — ${composer}`;
+    }
+    if (/eucharist|mass/i.test(serviceTitle || '')) {
+      return `Mass in ${key} — ${composer}`;
+    }
+    return `Service in ${key} — ${composer}`;
+  }
+  return normalizePieceTitle(pieceText);
+}
+
 function formatServiceLine(service) {
   const dateStr = service.date.toISOString().split('T')[0];
-  const pieces = [
-    ...service.pieces.settings,
-    ...service.pieces.anthems,
-    ...service.pieces.psalms,
-    ...service.pieces.hymns
-  ].join('; ');
+  // Order: settings/canticles; anthems (plus uncategorised); psalms; hymns. Exclude organ.
+  const ordered = [];
+  const settingsRaw = service.pieces.settings || [];
+  const settings = settingsRaw.map(p => canonicalizeSettingPiece(p, service.service));
+  const anthems = (service.pieces.anthems || []).map(normalizePieceTitle);
+  const psalms = (service.pieces.psalms || []).map(normalizePieceTitle);
+  const hymns = (service.pieces.hymns || []).map(normalizePieceTitle);
+  const organ = new Set((service.pieces.organ || []));
+  const known = new Set([...(settingsRaw || []), ...anthems, ...psalms, ...hymns, ...organ]);
+  const isFeastNote = (p) => /\b(\d{3,4})\b/.test(p) && !/(psalm|hymn|anthem|magnificat|nunc dimittis|responses|canticles|service|mass|te deum|jubilate)/i.test(p);
+  const others = (service.allPieces || []).filter(p => !known.has(p) && !isOrganPiece(p) && !isFeastNote(p)).map(normalizePieceTitle);
+  ordered.push(...settings, ...anthems, ...others, ...psalms, ...hymns);
+  const finalFix = (s) => s
+    .replace(/\b(Mass\s+for)\s*[—–-]\s*/gi, '$1 ')
+    .replace(/\b(of)\s*[—–-]\s*/gi, '$1 ')
+    .replace(/\s{2,}/g, ' ');
+  const pieces = ordered.map(finalFix).join('; ');
   
-  const choir = service.choir.replace(/\band\b/g, '&');
+  const choir = service.choir.replace(/\band\b/gi, '&');
   return `${dateStr} ${service.time}    ${service.service}  |  ${choir}  |  ${pieces}`;
+}
+
+function piecesSummary(service) {
+  // Reuse the same ordering as formatServiceLine for consistency
+  const settingsRaw = service.pieces.settings || [];
+  const settings = settingsRaw.map(p => canonicalizeSettingPiece(p, service.service));
+  const anthems = (service.pieces.anthems || []).map(normalizePieceTitle);
+  const psalms = (service.pieces.psalms || []).map(normalizePieceTitle);
+  const hymns = (service.pieces.hymns || []).map(normalizePieceTitle);
+  const organ = new Set((service.pieces.organ || []));
+  const known = new Set([...(settingsRaw || []), ...anthems, ...psalms, ...hymns, ...organ]);
+  const isFeastNote = (p) => /\b(\d{3,4})\b/.test(p) && !/(psalm|hymn|anthem|magnificat|nunc dimittis|responses|canticles|service|mass|te deum|jubilate)/i.test(p);
+  const others = (service.allPieces || []).filter(p => !known.has(p) && !isOrganPiece(p) && !isFeastNote(p)).map(normalizePieceTitle);
+  const ordered = [...settings, ...anthems, ...others, ...psalms, ...hymns];
+  const finalFix = (s) => s
+    .replace(/\b(Mass\s+for)\s*[—–-]\s*/gi, '$1 ')
+    .replace(/\b(of)\s*[—–-]\s*/gi, '$1 ')
+    .replace(/\s{2,}/g, ' ');
+  return ordered.map(finalFix).join('; ');
+}
+
+function formatServiceHuman(service) {
+  const dateStr = service.date.toISOString().split('T')[0];
+  const choir = service.choir.replace(/\band\b/gi, '&');
+  const settings = (service.pieces.settings || []).map(p => canonicalizeSettingPiece(p, service.service));
+  const anthems = (service.pieces.anthems || []).map(normalizePieceTitle);
+  const psalms = (service.pieces.psalms || []).map(normalizePieceTitle);
+  const hymns = (service.pieces.hymns || []).map(normalizePieceTitle);
+  const lines = [];
+  if (settings.length) lines.push(`Settings: ${settings.join('; ')}`);
+  if (anthems.length) lines.push(`Anthems: ${anthems.join('; ')}`);
+  if (psalms.length) lines.push(`Psalms: ${psalms.join('; ')}`);
+  if (hymns.length) lines.push(`Hymns: ${hymns.join('; ')}`);
+  const details = lines.join('\n');
+  return `${dateStr} ${service.time}  ${service.service}\nChoir: ${choir}${details ? `\n${details}` : ''}`;
 }
 
 function getStaleMessage() {
@@ -512,7 +735,8 @@ fastify.get('/songmen/next', async (request, reply) => {
     return getStaleMessage();
   }
   
-  return formatServiceLine(nextService);
+  // More human-readable, multi-line layout for /songmen/next
+  return formatServiceHuman(nextService);
 });
 
 fastify.get('/songmen/week', async (request, reply) => {
@@ -527,10 +751,10 @@ fastify.get('/songmen/week', async (request, reply) => {
   
   const weekServices = getCurrentWeekServices();
   if (weekServices.length === 0) {
-    return getStaleMessage();
+    return '';
   }
   
-  return weekServices.map(formatServiceLine).join('\n');
+  return weekServices.map(formatServiceHuman).join('\n\n');
 });
 
 fastify.get('/songmen/raw', async (request, reply) => {
@@ -545,6 +769,45 @@ fastify.get('/songmen/raw', async (request, reply) => {
     const header = `${dateStr} ${service.time} ${service.service} (${service.choir})`;
     return [header, ...service.rawLines, ''].join('\n');
   }).join('\n');
+});
+
+fastify.get('/songmen/tomorrow', async (request, reply) => {
+  reply.header('Content-Type', 'text/plain; charset=utf-8');
+  reply.header('X-Source-End-Date', cachedData.endDate ? cachedData.endDate.toISOString().split('T')[0] : '');
+  reply.header('X-Last-Fetch', cachedData.lastFetch ? cachedData.lastFetch.toISOString() : '');
+  reply.header('X-Stale', cachedData.isStale ? 'true' : 'false');
+
+  if (cachedData.isStale || cachedData.error) {
+    return getStaleMessage();
+  }
+
+  const tomorrowServices = getTomorrowServices();
+  if (tomorrowServices.length === 0) return '';
+  return tomorrowServices.map(formatServiceHuman).join('\n\n');
+});
+
+fastify.get('/songmen/day', async (request, reply) => {
+  reply.header('Content-Type', 'text/plain; charset=utf-8');
+  reply.header('X-Source-End-Date', cachedData.endDate ? cachedData.endDate.toISOString().split('T')[0] : '');
+  reply.header('X-Last-Fetch', cachedData.lastFetch ? cachedData.lastFetch.toISOString() : '');
+  reply.header('X-Stale', cachedData.isStale ? 'true' : 'false');
+
+  if (cachedData.isStale || cachedData.error) {
+    return getStaleMessage();
+  }
+
+  const query = request.query || {};
+  let targetDateStr;
+  if (typeof query.date === 'string' && /\d{4}-\d{2}-\d{2}/.test(query.date)) {
+    targetDateStr = query.date;
+  } else {
+    const now = getMockDate() || new Date();
+    targetDateStr = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString().split('T')[0];
+  }
+
+  const dayServices = getServicesOnDate(targetDateStr);
+  if (dayServices.length === 0) return '';
+  return dayServices.map(formatServiceHuman).join('\n\n');
 });
 
 fastify.get('/status', async (request, reply) => {
@@ -568,6 +831,7 @@ fastify.get('/status', async (request, reply) => {
   ].filter(line => line).join('\n');
 });
 
+// Back-compat: /json remains as "next"
 fastify.get('/json', async (request, reply) => {
   reply.header('Content-Type', 'application/json; charset=utf-8');
   reply.header('X-Source-End-Date', cachedData.endDate ? cachedData.endDate.toISOString().split('T')[0] : '');
@@ -596,7 +860,66 @@ fastify.get('/json', async (request, reply) => {
     time: nextService.time,
     service: nextService.service,
     choir: nextService.choir,
-    pieces: nextService.pieces,
+    pieces: {
+      settings: (nextService.pieces.settings || []).map(p => canonicalizeSettingPiece(p, nextService.service)),
+      anthems: (nextService.pieces.anthems || []).map(normalizePieceTitle),
+      psalms: (nextService.pieces.psalms || []).map(normalizePieceTitle),
+      hymns: (nextService.pieces.hymns || []).map(normalizePieceTitle),
+      organ: nextService.pieces.organ || []
+    },
+    source: {
+      music_list_url: cachedData.sourceUrl,
+      end_date: cachedData.endDate ? cachedData.endDate.toISOString().split('T')[0] : null,
+      fetched_at: cachedData.lastFetch ? cachedData.lastFetch.toISOString() : null
+    },
+    stale: false
+  };
+});
+
+fastify.get('/json/next', async (request, reply) => {
+  // Alias of /json but explicit path
+  return fastify.inject({ method: 'GET', url: '/json' }).then(r => {
+    reply.headers(r.headers);
+    reply.code(r.statusCode);
+    return r.payload;
+  });
+});
+
+fastify.get('/json/week', async (request, reply) => {
+  reply.header('Content-Type', 'application/json; charset=utf-8');
+  reply.header('X-Source-End-Date', cachedData.endDate ? cachedData.endDate.toISOString().split('T')[0] : '');
+  reply.header('X-Last-Fetch', cachedData.lastFetch ? cachedData.lastFetch.toISOString() : '');
+  reply.header('X-Stale', cachedData.isStale ? 'true' : 'false');
+
+  if (cachedData.isStale || cachedData.error) {
+    return {
+      services: [],
+      source: {
+        music_list_url: cachedData.sourceUrl,
+        end_date: cachedData.endDate ? cachedData.endDate.toISOString().split('T')[0] : null,
+        fetched_at: cachedData.lastFetch ? cachedData.lastFetch.toISOString() : null
+      },
+      stale: true
+    };
+  }
+
+  const weekServices = getCurrentWeekServices();
+  const servicesJson = weekServices.map(svc => ({
+    date: svc.date.toISOString().split('T')[0],
+    time: svc.time,
+    service: svc.service,
+    choir: svc.choir,
+    pieces: {
+      settings: (svc.pieces.settings || []).map(p => canonicalizeSettingPiece(p, svc.service)),
+      anthems: (svc.pieces.anthems || []).map(normalizePieceTitle),
+      psalms: (svc.pieces.psalms || []).map(normalizePieceTitle),
+      hymns: (svc.pieces.hymns || []).map(normalizePieceTitle),
+      organ: svc.pieces.organ || []
+    }
+  }));
+
+  return {
+    services: servicesJson,
     source: {
       music_list_url: cachedData.sourceUrl,
       end_date: cachedData.endDate ? cachedData.endDate.toISOString().split('T')[0] : null,
