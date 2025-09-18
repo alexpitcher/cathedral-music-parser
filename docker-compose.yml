@@ -1,4 +1,3 @@
-version: '3.8'
 services:
   cathedral-music-parser:
     image: ghcr.io/alexpitcher/cathedral-music-parser:main
