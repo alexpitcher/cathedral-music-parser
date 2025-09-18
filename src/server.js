@@ -12,7 +12,7 @@ const fastify = Fastify({ logger: false });
 let cachedData = {
   services: [],
   sourceUrl: '',
-  pdfUrl: '',
+  pdfUrls: [],
   endDate: null,
   lastFetch: null,
   isStale: false,
@@ -23,6 +23,7 @@ let cachedData = {
 const PORT = process.env.PORT || 3000;
 const MUSIC_LIST_URL = process.env.MUSIC_LIST_URL || 'https://leicestercathedral.org/music-list/';
 const MUSIC_LIST_PDF_PATH = process.env.MUSIC_LIST_PDF_PATH || process.env.FIXTURE_PDF_PATH || null;
+const MAX_PDFS = parseInt(process.env.MAX_PDFS || '3', 10);
 const MOCK_DATE = process.env.MOCK_DATE; // Format: YYYY-MM-DD or full ISO timestamp
 
 function getMockDate() {
@@ -329,13 +330,76 @@ async function discoverLatestPDF() {
   }
 }
 
+// Discover multiple PDFs on the page and return sorted by end date (latest first)
+async function discoverLatestPDFs() {
+  try {
+    const response = await fetch(MUSIC_LIST_URL);
+    const html = await response.text();
+    const $ = cheerio.load(html);
+
+    const monthMap = {
+      january: 0, february: 1, march: 2, april: 3, may: 4, june: 5,
+      july: 6, august: 7, september: 8, october: 9, november: 10, december: 11
+    };
+
+    const results = [];
+    const seen = new Set();
+    const currentYear = new Date().getFullYear();
+    $('a[href*=".pdf"]').each((i, link) => {
+      const href = $(link).attr('href');
+      const text = $(link).text().trim();
+      if (!href) return;
+      const url = href.startsWith('http') ? href : `https://leicestercathedral.org${href}`;
+      if (seen.has(url)) return;
+      // Look for "to DD MONTH" pattern
+      const match = text.match(/to\s+(\d{1,2})\s+(\w+)/i);
+      if (match) {
+        const day = parseInt(match[1]);
+        const month = match[2].toLowerCase();
+        if (monthMap[month] !== undefined) {
+          const date = new Date(currentYear, monthMap[month], day);
+          results.push({ url, endDate: date });
+          seen.add(url);
+        }
+      }
+    });
+
+    results.sort((a, b) => (b.endDate?.getTime() || 0) - (a.endDate?.getTime() || 0));
+    return results;
+  } catch (error) {
+    throw new Error(`Failed to discover PDFs: ${error.message}`);
+  }
+}
+
+function dedupeServices(services) {
+  const map = new Map();
+  for (const svc of services) {
+    if (!svc || !svc.date || !svc.time) continue;
+    const dateStr = svc.date.toISOString().split('T')[0];
+    const key = `${dateStr}|${svc.time}|${(svc.service || '').trim()}|${(svc.choir || '').trim()}`;
+    if (!map.has(key)) {
+      map.set(key, svc);
+    }
+  }
+  return Array.from(map.values());
+}
+
 async function parsePDF(pdfUrl) {
   try {
+    if (!pdfUrl || typeof pdfUrl !== 'string' || !pdfUrl.trim()) {
+      throw new Error('No PDF URL provided');
+    }
     const response = await fetch(pdfUrl);
+    if (!response) {
+      throw new Error(`Fetch returned null/undefined for URL: ${pdfUrl}`);
+    }
+    if (!response.ok) {
+      throw new Error(`HTTP error fetching PDF: ${response.status} ${response.statusText}`);
+    }
     const arrayBuffer = await response.arrayBuffer();
     return await parsePDFBuffer(new Uint8Array(arrayBuffer));
   } catch (error) {
-    throw new Error(`Failed to parse PDF: ${error.message}`);
+    throw new Error(`Failed to parse PDF (${pdfUrl || 'unknown'}): ${error.message}`);
   }
 }
 
@@ -510,24 +574,35 @@ async function parsePDFBuffer(uint8)
 
 async function refreshData() {
   try {
-    let pdfUrl = null;
-    let discoveredEndDate = null;
-    let parsed;
+    let pdfUrls = [];
+    let endDates = [];
+    let allServices = [];
 
     if (MUSIC_LIST_PDF_PATH) {
-      const buf = await fs.readFile(MUSIC_LIST_PDF_PATH);
-      parsed = await parsePDFBuffer(new Uint8Array(buf));
-      pdfUrl = `file://${MUSIC_LIST_PDF_PATH}`;
-      discoveredEndDate = parsed.endDate;
+      const paths = MUSIC_LIST_PDF_PATH.split(',').map(s => s.trim()).filter(Boolean);
+      for (const p of paths) {
+        const buf = await fs.readFile(p);
+        const parsed = await parsePDFBuffer(new Uint8Array(buf));
+        allServices.push(...parsed.services);
+        if (parsed.endDate) endDates.push(parsed.endDate);
+        pdfUrls.push(`file://${p}`);
+      }
     } else {
-      const discovered = await discoverLatestPDF();
-      pdfUrl = discovered.url;
-      discoveredEndDate = discovered.endDate;
-      parsed = await parsePDF(pdfUrl);
+      const discovered = await discoverLatestPDFs();
+      if (!discovered || discovered.length === 0) {
+        throw new Error('No PDF link found on the music list page');
+      }
+      for (const entry of discovered.slice(0, Math.max(1, MAX_PDFS))) {
+        const parsed = await parsePDF(entry.url);
+        allServices.push(...parsed.services);
+        if (parsed.endDate) endDates.push(parsed.endDate);
+        else if (entry.endDate) endDates.push(entry.endDate);
+        pdfUrls.push(entry.url);
+      }
     }
-    const { services } = parsed;
-    
-    const finalEndDate = parsed.endDate || discoveredEndDate;
+
+    const services = dedupeServices(allServices);
+    const finalEndDate = endDates.length ? new Date(Math.max(...endDates.map(d => d.getTime()))) : null;
     const now = getMockDate() || new Date();
     const isStale = finalEndDate && now > finalEndDate;
     
@@ -547,7 +622,7 @@ async function refreshData() {
     cachedData = {
       services: qualifying,
       sourceUrl: MUSIC_LIST_URL,
-      pdfUrl,
+      pdfUrls,
       endDate: finalEndDate,
       lastFetch: now,
       isStale,
@@ -821,7 +896,7 @@ fastify.get('/status', async (request, reply) => {
   
   return [
     `source_page_url: ${cachedData.sourceUrl}`,
-    `latest_pdf_url: ${cachedData.pdfUrl}`,
+    `pdf_urls: ${(cachedData.pdfUrls || []).join(', ')}`,
     `end_date: ${cachedData.endDate ? cachedData.endDate.toISOString().split('T')[0] : 'unknown'}`,
     `last_fetch: ${cachedData.lastFetch ? cachedData.lastFetch.toISOString() : 'never'}`,
     `services_parsed: ${cachedData.services.length}`,
