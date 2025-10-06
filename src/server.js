@@ -52,15 +52,19 @@ function normalizeOCRArtifacts(text) {
   let t = text;
   // Join digits split by spaces (e.g., 89.2 0 -> 89.20)
   t = t.replace(/(?<=\d)\s+(?=\d)/g, '');
+  // Fix BWV numbers split by spaces (e.g., BWV5 48i -> BWV548i)
+  t = t.replace(/\bBWV\s*(\d+)\s+(\d+[a-z]?)\b/gi, 'BWV$1$2');
   // Fix Hymn s -> Hymns
   t = t.replace(/\bHymn\s+s\b/gi, 'Hymns');
   // Fix split words like V oluntary, S aviour but not musical keys (E flat, D major, etc.)
   const noJoinNext = new Set(['flat','sharp','major','minor']);
   t = t.replace(/\b([A-Z])\s+([a-z]{2,})\b/g, (m, a, b) => noJoinNext.has(b) ? m : `${a}${b}`);
-  // Normalise L’Estrange from various broken OCR forms
-  t = t.replace(/L\s*[’'`-]+\s*(?:[-—]\s*)?Estrange/gi, "L’Estrange");
+  // Normalise L'Estrange from various broken OCR forms
+  // Handles: "L'Estrange", "L 'Estrange", "L ' Estrange", "L - Estrange", etc.
+  // The OCR can split this many ways - match L, then any combination of spaces/punctuation, then Estrange
+  t = t.replace(/L[\s''`\-—]+Estrange/gi, "L'Estrange");
   // Fix Mass for — Five Voices Byrd -> Mass for Five Voices — Byrd
-  t = t.replace(/^Mass\s+for\s+—\s+(.+?)\s+([A-Z][A-Za-z’'\-]+)$/, 'Mass for $1 — $2');
+  t = t.replace(/^Mass\s+for\s+—\s+(.+?)\s+([A-Z][A-Za-z''\-]+)$/, 'Mass for $1 — $2');
   // Also remove stray dash right after "Mass for" so composer formatting can re-add correctly
   t = t.replace(/\b(Mass\s+for)\s+[—–-]\s+/i, '$1 ');
   // Remove stray em-dash after preposition "of" (e.g., Accession of — King Charles III)
@@ -148,38 +152,46 @@ function normalizePieceTitle(text) {
   // Clean stray dash after "Mass for"
   text = text.replace(/(Mass\s+for)\s*[—–-]\s*/gi, '$1 ');
   // Fix cases like "A Prayer of — St Patrick Rutter" -> "A Prayer of St Patrick — Rutter"
-  text = text.replace(/\bof\s+[—–-]\s+(St(?:\.?|aint)?\s+[A-Z][A-Za-z’'\-]+)\s+([A-Z][A-Za-z’'\-]+)/, 'of $1 — $2');
+  text = text.replace(/\bof\s+[—–-]\s+(St(?:\.?|aint)?\s+[A-Z][A-Za-z''\-]+)\s+([A-Z][A-Za-z''\-]+)/, 'of $1 — $2');
   // Collapse odd dash sequences like " - — " -> " — "
   text = text.replace(/\s+-\s+—\s+/g, ' — ');
-  
+
   // Handle "Composer: Title" format
   const colonMatch = text.match(/^(.+?):\s*(.+)$/);
   if (colonMatch) {
     return `${colonMatch[2].trim()} — ${colonMatch[1].trim()}`;
   }
-  
+
   // Handle "Title  Composer" format (multiple spaces)
   const spacesMatch = text.match(/^(.+?)\s{2,}(.+)$/);
   if (spacesMatch) {
     return `${spacesMatch[1].trim()} — ${spacesMatch[2].trim()}`;
   }
-  
+
+  // Handle "Title arr. Arranger" and "Title Trad. Attribution" formats
+  // e.g., "Angelus ad virginem arr. Willcocks" -> "Angelus ad virginem — arr. Willcocks"
+  // e.g., "Deep river Trad. African American" -> "Deep river — Trad. African American"
+  const arrangementMatch = text.match(/^(.+?)\s+(arr\.|Trad\.)\s+(.+)$/i);
+  if (arrangementMatch) {
+    return `${arrangementMatch[1].trim()} — ${arrangementMatch[2]} ${arrangementMatch[3].trim()}`;
+  }
+
   // Leave bare "Composer in Key" mappings for settings to higher-level formatter
-  
+
   // Handle "Psalm NN Composer" format
   const psalmComposerMatch = text.match(/^(Psalm\s+[\d\.–\-]+)\s+([A-Z][a-zA-Z\s\.]*?)$/i);
   if (psalmComposerMatch) {
     return `${psalmComposerMatch[1].trim()} — ${psalmComposerMatch[2].trim()}`;
   }
-  
+
   // Handle "Mass for — Five Voices Byrd" -> "Mass for Five Voices — Byrd"
-  text = text.replace(/\bMass\s+for\s+—\s+([^—;]+?)\s+([A-Z][A-Za-z’'\-]+)\b/, 'Mass for $1 — $2');
+  text = text.replace(/\bMass\s+for\s+—\s+([^—;]+?)\s+([A-Z][A-Za-z''\-]+)\b/, 'Mass for $1 — $2');
   // Handle "Piece Composer" format (single space, composer may include apostrophes/hyphens)
-  const spaceMatch = text.match(/^(.+?)\s+([A-Z][A-Za-z’'\-]+(?:\s+[A-Z][A-Za-z’'\-\.]+)*)\s*$/);
+  const spaceMatch = text.match(/^(.+?)\s+([A-Z][A-Za-z''\-]+(?:\s+[A-Z][A-Za-z''\-\.]+)*)\s*$/);
   if (spaceMatch && !text.match(/\d/) && spaceMatch[2].length < 30) {
     return `${spaceMatch[1].trim()} — ${spaceMatch[2].trim()}`;
   }
-  
+
   return text;
 }
 
@@ -439,10 +451,14 @@ async function parsePDFBuffer(uint8)
       for (const y of sortedYPositions) {
         // Sort items on this line by X position (left to right)
         const lineItems = lineGroups[y].sort((a, b) => a.x - b.x);
-        const lineText = lineItems.map(item => item.text).join(' ').trim();
-        
+        let lineText = lineItems.map(item => item.text).join(' ').trim();
+
         if (lineText) {
-          allLines.push(normalizeOCRArtifacts(normalizeUnicode(lineText)));
+          // First normalize unicode and collapse all excessive spacing
+          lineText = normalizeUnicode(lineText);
+          // Then apply OCR-specific fixes
+          lineText = normalizeOCRArtifacts(lineText);
+          allLines.push(lineText);
         }
       }
     }
