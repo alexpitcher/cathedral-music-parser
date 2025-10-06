@@ -30,14 +30,12 @@ Public image: `ghcr.io/alexpitcher/cathedral-music-parser`
 # Pull the image (use a specific tag like :main, :v1.2.3, or :<sha>)
 docker pull ghcr.io/alexpitcher/cathedral-music-parser:main
 
-# Run on port 3000
+# Run on port 3000 (fetches PDFs from live site automatically)
 docker run --rm -p 3000:3000 ghcr.io/alexpitcher/cathedral-music-parser:main
 
-# With a local fixture and mock date
+# With a mock date for testing (still fetches from live site)
 docker run --rm -p 3000:3000 \
-  -e MUSIC_LIST_PDF_PATH=/data/music-list.pdf \
   -e MOCK_DATE=2025-09-01 \
-  -v $(pwd)/music-list.pdf:/data/music-list.pdf:ro \
   ghcr.io/alexpitcher/cathedral-music-parser:main
 ```
 
@@ -46,6 +44,24 @@ If the package is private, authenticate first:
 ```bash
 echo $GHCR_TOKEN | docker login ghcr.io -u <github-username> --password-stdin
 ```
+
+### Using Local PDF Fixtures with Docker
+
+To test with a local PDF file, the file must exist before mounting. Only mount existing files:
+
+```bash
+# Ensure the PDF exists first
+ls music-list.pdf
+
+# Then mount it (will fail if file doesn't exist)
+docker run --rm -p 3000:3000 \
+  -e MUSIC_LIST_PDF_PATH=/data/music-list.pdf \
+  -e MOCK_DATE=2025-09-01 \
+  -v $(pwd)/music-list.pdf:/data/music-list.pdf:ro \
+  ghcr.io/alexpitcher/cathedral-music-parser:main
+```
+
+**Note**: Docker will create a directory if the source file doesn't exist, causing an error. Always verify the file exists first.
 
 ## Endpoints
 
@@ -124,8 +140,15 @@ docker run --rm -p 3000:3000 cathedral-music-parser:local
 
 # Or via Docker Compose
 docker compose up --build
+```
 
-# With a local fixture PDF and a mock date
+### Testing with Local PDF Fixtures
+
+```bash
+# Ensure the PDF exists first
+ls music-list.pdf
+
+# Then mount it with mock date
 docker run --rm -p 3000:3000 \
   -e MUSIC_LIST_PDF_PATH=/data/music-list.pdf \
   -e MOCK_DATE=2025-09-01 \
