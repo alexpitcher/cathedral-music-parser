@@ -597,6 +597,15 @@ async function refreshData() {
     if (MUSIC_LIST_PDF_PATH) {
       const paths = MUSIC_LIST_PDF_PATH.split(',').map(s => s.trim()).filter(Boolean);
       for (const p of paths) {
+        // Check if path exists and is a file
+        const stats = await fs.stat(p).catch(() => null);
+        if (!stats) {
+          throw new Error(`PDF path does not exist: ${p}`);
+        }
+        if (stats.isDirectory()) {
+          throw new Error(`PDF path is a directory, not a file: ${p}`);
+        }
+
         const buf = await fs.readFile(p);
         const parsed = await parsePDFBuffer(new Uint8Array(buf));
         allServices.push(...parsed.services);
